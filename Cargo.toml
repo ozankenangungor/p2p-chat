@@ -1,0 +1,49 @@
+[package]
+name = "p2p-chat"
+version = "0.1.0"
+edition = "2021"
+authors = ["ozankenangungor"]
+description = "A peer-to-peer chat application built with libp2p"
+license = "MIT"
+repository = "https://github.com/ozankenangungor/p2p-chat"
+readme = "README.md"
+keywords = ["p2p", "chat", "libp2p", "networking"]
+categories = ["network-programming"]
+
+[dependencies]
+tokio = { version = "1.43", features = ["full", "signal"] }
+
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "tcp",
+    "noise",
+    "yamux",
+    "ping",
+    "request-response",
+    "json",
+    "macros",
+] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+thiserror = "1.0"
+anyhow = "1.0"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+clap = { version = "4.5", features = ["derive", "env"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[[bin]]
+name = "p2p-chat"
+path = "src/main.rs"

@@ -1,0 +1,14 @@
+# Clippy configuration
+# https://doc.rust-lang.org/clippy/configuration.html
+
+# Minimum supported Rust version
+msrv = "1.75"
+
+# Threshold for cognitive complexity
+cognitive-complexity-threshold = 25
+
+# Maximum number of function parameters
+too-many-arguments-threshold = 8
+
+# Maximum number of lines per function
+too-many-lines-threshold = 100

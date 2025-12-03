@@ -1,8 +1,9 @@
 use crate::config::PROTOCOL_NAME;
+use libp2p::mdns;
 use libp2p::ping;
 use libp2p::request_response::{self, json, ProtocolSupport};
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::StreamProtocol;
+use libp2p::{PeerId, StreamProtocol};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -62,22 +63,25 @@ impl Default for MessageResponse {
 pub struct ChatBehaviour {
     pub ping: ping::Behaviour,
     pub messaging: json::Behaviour<MessageRequest, MessageResponse>,
+    pub mdns: mdns::tokio::Behaviour,
 }
 
 impl ChatBehaviour {
-    pub fn new(ping_interval: Duration) -> Self {
+    pub fn new(local_peer_id: PeerId, ping_interval: Duration) -> std::io::Result<Self> {
         let ping_config = ping::Config::new().with_interval(ping_interval);
-
         let messaging_config =
             request_response::Config::default().with_request_timeout(Duration::from_secs(30));
+        let mdns_config = mdns::Config::default();
+        let mdns = mdns::tokio::Behaviour::new(mdns_config, local_peer_id)?;
 
-        Self {
+        Ok(Self {
             ping: ping::Behaviour::new(ping_config),
             messaging: json::Behaviour::new(
                 [(StreamProtocol::new(PROTOCOL_NAME), ProtocolSupport::Full)],
                 messaging_config,
             ),
-        }
+            mdns,
+        })
     }
 }
 

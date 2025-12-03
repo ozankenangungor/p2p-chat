@@ -2,12 +2,9 @@ use clap::Parser;
 use libp2p::Multiaddr;
 use std::time::Duration;
 
-pub const DEFAULT_PORT: u16 = 9999;
-
+pub const DEFAULT_PORT: u16 = 0;
 pub const DEFAULT_PING_INTERVAL_SECS: u64 = 10;
-
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
-
 pub const PROTOCOL_NAME: &str = "/p2p-chat/1.0.0";
 
 #[derive(Parser, Debug, Clone)]
@@ -30,6 +27,9 @@ pub struct Config {
 
     #[arg(long, default_value_t = DEFAULT_IDLE_TIMEOUT_SECS)]
     pub idle_timeout: u64,
+
+    #[arg(long, default_value_t = true)]
+    pub mdns: bool,
 
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,
@@ -71,6 +71,7 @@ impl Default for Config {
             peer: None,
             ping_interval: DEFAULT_PING_INTERVAL_SECS,
             idle_timeout: DEFAULT_IDLE_TIMEOUT_SECS,
+            mdns: true,
             verbose: false,
             log_level: "info".to_string(),
         }
@@ -92,7 +93,20 @@ mod tests {
     #[test]
     fn test_listen_addr() {
         let config = Config::default();
+        assert_eq!(config.listen_addr(), "/ip4/0.0.0.0/tcp/0");
+    }
+
+    #[test]
+    fn test_listen_addr_custom_port() {
+        let mut config = Config::default();
+        config.port = 9999;
         assert_eq!(config.listen_addr(), "/ip4/0.0.0.0/tcp/9999");
+    }
+
+    #[test]
+    fn test_mdns_enabled_by_default() {
+        let config = Config::default();
+        assert!(config.mdns);
     }
 
     #[test]

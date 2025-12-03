@@ -9,6 +9,8 @@ A peer-to-peer chat application built with [libp2p](https://libp2p.io/) in Rust.
 
 - 🔐 **Secure Communication**: Uses Noise protocol for encrypted connections
 - 🌐 **Peer-to-Peer**: Direct communication without central servers
+- 🔍 **mDNS Discovery**: Automatic peer discovery on local networks
+- 📢 **Broadcast Messaging**: Send messages to all connected peers
 - 🏓 **Connection Health**: Automatic ping/pong for connection monitoring
 - 📝 **JSON Protocol**: Structured message format for extensibility
 - ⚡ **Async Runtime**: Built on Tokio for high performance
@@ -36,24 +38,38 @@ cargo build --release
 
 ## Usage
 
-### Starting a Peer (Listener)
+### Quick Start with mDNS (Recommended)
 
-Start the first peer that will listen for connections:
+The easiest way to use P2P Chat is with mDNS auto-discovery. Just run the application on multiple machines on the same local network:
 
 ```bash
-# Using default port 9999
+# Terminal 1 - Start first peer (random port)
 p2p-chat
 
-# Using a custom port
+# Terminal 2 - Start second peer (random port)
+p2p-chat
+
+# They will automatically discover each other via mDNS!
+```
+
+### Starting a Peer (Listener)
+
+Start a peer that will listen for connections:
+
+```bash
+# Using random OS-assigned port (default)
+p2p-chat
+
+# Using a specific port
 p2p-chat --port 9999
 ```
 
 ### Connecting to a Peer
 
-Start a second peer and connect to the first one:
+You can also manually connect to a specific peer:
 
 ```bash
-# Connect to a peer
+# Connect to a peer directly
 p2p-chat --port 9998 --peer /ip4/127.0.0.1/tcp/9999
 
 # Or using environment variables
@@ -62,15 +78,16 @@ CHAT_P2P_PORT=9998 CHAT_PEER=/ip4/127.0.0.1/tcp/9999 p2p-chat
 
 ### Commands
 
-Once connected, you can use the following commands:
+Once running, you can use the following commands:
 
-| Command | Description |
-|---------|-------------|
-| `/help` | Show available commands |
-| `/peers` | List connected peers |
-| `/quit` | Exit the application |
+| Command   | Description                    |
+|-----------|--------------------------------|
+| `/help`   | Show available commands        |
+| `/peers`  | List connected & discovered peers |
+| `/status` | Show connection status         |
+| `/quit`   | Exit the application           |
 
-Type any other text to send it as a message to the connected peer.
+Type any other text to broadcast it to all connected peers.
 
 ### CLI Options
 
@@ -78,15 +95,37 @@ Type any other text to send it as a message to the connected peer.
 Usage: p2p-chat [OPTIONS]
 
 Options:
-  -p, --port <PORT>              Port to listen on [env: CHAT_P2P_PORT] [default: 9999]
+  -p, --port <PORT>              Port to listen on (0 for random) [env: CHAT_P2P_PORT] [default: 0]
   -c, --peer <PEER>              Peer address to connect to [env: CHAT_PEER]
       --ping-interval <SECONDS>  Ping interval in seconds [default: 10]
       --idle-timeout <SECONDS>   Idle connection timeout in seconds [default: 30]
+      --mdns <BOOL>              Enable mDNS for local network discovery [default: true]
   -v, --verbose                  Enable verbose logging
       --log-level <LEVEL>        Log level (trace, debug, info, warn, error) [default: info]
   -h, --help                     Print help
   -V, --version                  Print version
 ```
+
+## How mDNS Discovery Works
+
+```
+┌─────────────────┐     mDNS Broadcast      ┌─────────────────┐
+│   Application   │ ──────────────────────► │   Application   │
+│      (Peer 1)   │                         │      (Peer 2)   │
+│                 │ ◄────────────────────── │                 │
+│  Broadcasts its │     mDNS Response       │  Discovers and  │
+│   presence      │                         │   connects      │
+└─────────────────┘                         └─────────────────┘
+         │                                           │
+         │              TCP Connection               │
+         └───────────────────────────────────────────┘
+                    Encrypted Chat Messages
+```
+
+1. Each peer broadcasts its presence via mDNS (multicast DNS)
+2. Other peers on the same network discover the broadcast
+3. Discovered peers automatically connect to each other
+4. Messages are broadcast to all connected peers
 
 ## Architecture
 
@@ -105,6 +144,7 @@ The application uses the following libp2p protocols:
 
 - **Transport**: TCP with Noise encryption and Yamux multiplexing
 - **Ping**: Connection health monitoring
+- **mDNS**: Local network peer discovery (multicast DNS)
 - **Request-Response**: JSON-based messaging protocol (`/p2p-chat/1.0.0`)
 
 ### Message Format

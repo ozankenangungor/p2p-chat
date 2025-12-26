@@ -1,0 +1,112 @@
+name: CI
+
+on:
+    push:
+        branches: [main, master]
+    pull_request:
+        branches: [main, master]
+
+env:
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+
+jobs:
+    check:
+        name: Check
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-action@stable
+
+            - name: Run cargo check
+              run: cargo check --all-features
+
+    fmt:
+        name: Rustfmt
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-action@stable
+              with:
+                  components: rustfmt
+
+            - name: Run cargo fmt
+              run: cargo fmt --all -- --check
+
+    clippy:
+        name: Clippy
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-action@stable
+              with:
+                  components: clippy
+
+            - name: Run cargo clippy
+              run: cargo clippy --all-features -- -D warnings
+
+    test:
+        name: Test
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                os: [ubuntu-latest, macos-latest]
+                rust: [stable, beta]
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-action@${{ matrix.rust }}
+
+            - name: Run cargo test
+              run: cargo test --all-features
+
+    build:
+        name: Build Release
+        runs-on: ${{ matrix.os }}
+        strategy:
+            matrix:
+                include:
+                    - os: ubuntu-latest
+                      target: x86_64-unknown-linux-gnu
+                      artifact: p2p-chat
+                    - os: macos-latest
+                      target: x86_64-apple-darwin
+                      artifact: p2p-chat
+                    - os: macos-latest
+                      target: aarch64-apple-darwin
+                      artifact: p2p-chat
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-action@stable
+              with:
+                  targets: ${{ matrix.target }}
+
+            - name: Build release
+              run: cargo build --release --target ${{ matrix.target }}
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ matrix.artifact }}-${{ matrix.target }}
+                  path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+
+    security-audit:
+        name: Security Audit
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install cargo-audit
+              run: cargo install cargo-audit
+
+            - name: Run security audit
+              run: cargo audit

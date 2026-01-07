@@ -1,7 +1,20 @@
 pub mod behaviour;
 pub mod config;
+pub mod control_plane;
+pub mod download;
 pub mod error;
+pub mod grpc_api;
+pub mod identity;
+pub mod manifest;
+pub mod merkle;
+pub mod node;
+pub mod protocol;
+pub mod storage;
+pub mod validation;
 
-pub use behaviour::{ChatBehaviour, ChatBehaviourEvent, MessageRequest, MessageResponse};
-pub use config::Config;
-pub use error::{ChatError, Result};
+pub use behaviour::{swarm_protocols, NodeBehaviour, NodeBehaviourEvent};
+pub use config::{Cli, Command, DaemonArgs};
+pub use error::{NodeError, Result};
+pub use manifest::Manifest;
+pub use node::{NodeClient, NodeHandle, NodeStatusSnapshot, PeerSnapshot};
+pub use storage::{DownloadPhase, DownloadProgress, ProvideState, RocksStorageConfig, RocksStore};

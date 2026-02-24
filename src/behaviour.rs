@@ -195,6 +195,7 @@ mod tests {
         DaemonArgs {
             listen_p2p,
             grpc_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 50051)),
+            allow_remote_control: false,
             peers: Vec::new(),
             mdns,
             key_file: PathBuf::from("./node_key"),

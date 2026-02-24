@@ -776,7 +776,7 @@ impl NodeRuntime {
                 let _ = reply.send(result);
             }
             NodeCommand::Provide { cid, reply } => {
-                let result = self.begin_provide(cid, Some(reply));
+                let result = self.begin_provide(cid, Some(reply)).await;
                 if let Err(error) = result {
                     warn!("provide command failed before query start: {error:#}");
                 }
@@ -923,25 +923,41 @@ impl NodeRuntime {
         })
     }
 
-    fn begin_provide(
+    async fn begin_provide(
         &mut self,
         cid: String,
         sender: Option<oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
-        validate_cid_hex(&cid)?;
-        let key = NodeBehaviour::local_record_key(&cid);
+        let start_result: Result<QueryId> = async {
+            validate_cid_hex(&cid)?;
+            if self.store.get_manifest(&cid).await?.is_none() {
+                return Err(anyhow!("local manifest not found for cid {cid}"));
+            }
 
-        let query_id = self
-            .swarm
-            .behaviour_mut()
-            .kademlia
-            .start_providing(key)
-            .map_err(|error| anyhow!("failed to start_providing: {error}"))?;
+            let key = NodeBehaviour::local_record_key(&cid);
+            self.swarm
+                .behaviour_mut()
+                .kademlia
+                .start_providing(key)
+                .map_err(|error| anyhow!("failed to start_providing: {error}"))
+        }
+        .await;
 
-        self.pending_provide
-            .insert(query_id, PendingProvide { cid, sender });
+        match start_result {
+            Ok(query_id) => {
+                self.pending_provide
+                    .insert(query_id, PendingProvide { cid, sender });
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(sender) = sender {
+                    let _ = sender.send(Err(error));
+                    return Ok(());
+                }
 
-        Ok(())
+                Err(error)
+            }
+        }
     }
 
     async fn start_download(&mut self, cid: String, output_path: PathBuf) -> Result<()> {
@@ -961,6 +977,7 @@ impl NodeRuntime {
             global_concurrency: self.args.global_download_concurrency.max(1),
             per_peer_concurrency: self.args.per_peer_concurrency.max(1),
             max_retries: 4,
+            provider_discovery_retries: 8,
         };
         let cid_for_task = cid.clone();
 
@@ -1014,7 +1031,16 @@ impl NodeRuntime {
         let entries = self.store.list_providing().await?;
 
         for entry in entries {
-            if let Err(error) = self.begin_provide(entry.cid.clone(), None) {
+            if self.store.get_manifest(&entry.cid).await?.is_none() {
+                warn!(
+                    "dropping stale provide state for missing local cid {}",
+                    entry.cid
+                );
+                self.store.remove_provide_state(&entry.cid).await?;
+                continue;
+            }
+
+            if let Err(error) = self.begin_provide(entry.cid.clone(), None).await {
                 warn!("reprovide skipped for {}: {error:#}", entry.cid);
             }
         }

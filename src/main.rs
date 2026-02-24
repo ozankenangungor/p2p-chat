@@ -1,16 +1,16 @@
 use anyhow::{anyhow, Context, Result};
-use p2p_chat::config::{
+use p2p_dfs_node::config::{
     Cli, ClientAddArgs, ClientBaseArgs, ClientCancelDownloadArgs, ClientDownloadStatusArgs,
     ClientGetArgs, ClientProvideArgs, Command, DaemonArgs,
 };
-use p2p_chat::control_plane::DfsControlService;
-use p2p_chat::grpc_api::dfs::control::v1::dfs_control_client::DfsControlClient;
-use p2p_chat::grpc_api::dfs::control::v1::dfs_control_server::DfsControlServer;
-use p2p_chat::grpc_api::dfs::control::v1::{
+use p2p_dfs_node::control_plane::DfsControlService;
+use p2p_dfs_node::grpc_api::dfs::control::v1::dfs_control_client::DfsControlClient;
+use p2p_dfs_node::grpc_api::dfs::control::v1::dfs_control_server::DfsControlServer;
+use p2p_dfs_node::grpc_api::dfs::control::v1::{
     AddFileRequest, CancelDownloadRequest, DownloadStatusRequest, Empty, GetFileRequest,
     ProvideRequest,
 };
-use p2p_chat::node::start_node;
+use p2p_dfs_node::node::start_node;
 use tokio::signal;
 use tonic::transport::Server;
 use tracing::{debug, info};
@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
         Command::Daemon(args) => run_daemon(args).await,
         Command::Add(args) => run_add(args).await,
         Command::Provide(args) => run_provide(args).await,
+        Command::Providing(args) => run_providing(args).await,
         Command::Get(args) => run_get(args).await,
         Command::List(args) => run_list(args).await,
         Command::Status(args) => run_status(args).await,
@@ -48,6 +49,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_daemon(args: DaemonArgs) -> Result<()> {
+    args.validate()?;
     init_logging(&args.log_filter());
 
     let (handle, mut runtime_task) = start_node(args.clone()).await?;
@@ -167,6 +169,21 @@ async fn run_get(args: ClientGetArgs) -> Result<()> {
         .map_err(|error| anyhow!("GetFile request failed: {error}"))?;
 
     println!("accepted");
+    Ok(())
+}
+
+async fn run_providing(args: ClientBaseArgs) -> Result<()> {
+    let mut client = connect_client(&args).await?;
+    let response = client
+        .list_providing(Empty {})
+        .await
+        .map_err(|error| anyhow!("ListProviding request failed: {error}"))?
+        .into_inner();
+
+    for cid in response.cids {
+        println!("{cid}");
+    }
+
     Ok(())
 }
 

@@ -1,229 +1,110 @@
-# P2P Chat
+# p2p-chat
 
 [![Rust](https://github.com/ozankenangungor/p2p-chat/actions/workflows/ci.yml/badge.svg)](https://github.com/ozankenangungor/p2p-chat/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A peer-to-peer chat application built with [libp2p](https://libp2p.io/) in Rust.
+This repository started as a small libp2p chat experiment. It now runs as a DFS node: files are chunked, hashed, addressed by Merkle root, and exchanged over libp2p.
 
-## Features
+The app has two sides:
+- a daemon (`p2p-chat daemon`) that owns networking and storage
+- a local gRPC control plane that CLI commands talk to (`add`, `provide`, `get`, `status`, ...)
 
-- 🔐 **Secure Communication**: Uses Noise protocol for encrypted connections
-- 🌐 **Peer-to-Peer**: Direct communication without central servers
-- 🔍 **mDNS Discovery**: Automatic peer discovery on local networks
-- 📢 **Broadcast Messaging**: Send messages to all connected peers
-- 🏓 **Connection Health**: Automatic ping/pong for connection monitoring
-- 📝 **JSON Protocol**: Structured message format for extensibility
-- ⚡ **Async Runtime**: Built on Tokio for high performance
-- 🔧 **Configurable**: CLI arguments and environment variables support
+## What you get
 
-## Installation
+At a high level:
+- Content-addressed file storage (BLAKE3 chunk hashes + Merkle root CID)
+- RocksDB persistence with separate column families for metadata, chunks, provide state, and download state
+- Kademlia provider discovery/providing
+- Request/response protocols for metadata and chunk transfer
+- Optional gossipsub announcements for public files
+- Download orchestration with bounded concurrency, retries, and resumable progress
 
-### Prerequisites
+## Quick start
 
-- Rust 1.75 or higher
-- Cargo
-
-### From Source
+Build:
 
 ```bash
-# Clone the repository
-git clone https://github.com/ozankenangungor/p2p-chat.git
-cd p2p-chat
-
-# Build the project
 cargo build --release
-
-# The binary will be at ./target/release/p2p-chat
 ```
 
-## Usage
-
-### Quick Start with mDNS (Recommended)
-
-The easiest way to use P2P Chat is with mDNS auto-discovery. Just run the application on multiple machines on the same local network:
+Run a daemon:
 
 ```bash
-# Terminal 1 - Start first peer (random port)
-p2p-chat
-
-# Terminal 2 - Start second peer (random port)
-p2p-chat
-
-# They will automatically discover each other via mDNS!
+./target/release/p2p-chat daemon \
+  --listen-p2p /ip4/0.0.0.0/tcp/4001 \
+  --grpc-addr 127.0.0.1:50051 \
+  --db-path ./data/rocksdb \
+  --key-file ./data/node_key.ed25519
 ```
 
-### Starting a Peer (Listener)
+Notes:
+- `--key-file` gives you deterministic node identity.
+- If the key file is missing, it is generated and written with private permissions.
+- `Ctrl+C` triggers graceful shutdown (runtime + gRPC server).
 
-Start a peer that will listen for connections:
+## CLI workflow
+
+All client commands connect to local gRPC by default (`http://127.0.0.1:50051`).
 
 ```bash
-# Using random OS-assigned port (default)
-p2p-chat
+# Add a local file, print CID
+p2p-chat add ./file.bin
 
-# Using a specific port
-p2p-chat --port 9999
+# Add and announce (if daemon has announcements enabled)
+p2p-chat add ./file.bin --public
+
+# Advertise that this node provides CID
+p2p-chat provide <cid>
+
+# Download a file by CID
+p2p-chat get <cid> -o ./downloads/file.bin
+
+# Local state
+p2p-chat list
+p2p-chat status
+p2p-chat peers
+
+# Download lifecycle
+p2p-chat download-status <cid>
+p2p-chat cancel-download <cid>
 ```
 
-### Connecting to a Peer
-
-You can also manually connect to a specific peer:
+If your daemon is on a different local port:
 
 ```bash
-# Connect to a peer directly
-p2p-chat --port 9998 --peer /ip4/127.0.0.1/tcp/9999
-
-# Or using environment variables
-CHAT_P2P_PORT=9998 CHAT_PEER=/ip4/127.0.0.1/tcp/9999 p2p-chat
+p2p-chat status --grpc-addr http://127.0.0.1:60051
 ```
 
-### Commands
+## Networking and storage details
 
-Once running, you can use the following commands:
+- Transport: TCP + Noise + Yamux
+- Discovery: mDNS (toggleable) + Kademlia
+- DFS protocols:
+  - `/dfs/metadata/1.0.0`
+  - `/dfs/chunk/1.0.0`
+- RocksDB column families:
+  - `meta` (CID -> manifest)
+  - `chunk` (chunk_hash -> bytes)
+  - `provide` (CID -> provide state)
+  - `download` (CID -> progress)
 
-| Command   | Description                    |
-|-----------|--------------------------------|
-| `/help`   | Show available commands        |
-| `/peers`  | List connected & discovered peers |
-| `/status` | Show connection status         |
-| `/quit`   | Exit the application           |
+## Safety and hardening
 
-Type any other text to broadcast it to all connected peers.
-
-### CLI Options
-
-```
-Usage: p2p-chat [OPTIONS]
-
-Options:
-  -p, --port <PORT>              Port to listen on (0 for random) [env: CHAT_P2P_PORT] [default: 0]
-  -c, --peer <PEER>              Peer address to connect to [env: CHAT_PEER]
-      --ping-interval <SECONDS>  Ping interval in seconds [default: 10]
-      --idle-timeout <SECONDS>   Idle connection timeout in seconds [default: 30]
-      --mdns <BOOL>              Enable mDNS for local network discovery [default: true]
-  -v, --verbose                  Enable verbose logging
-      --log-level <LEVEL>        Log level (trace, debug, info, warn, error) [default: info]
-  -h, --help                     Print help
-  -V, --version                  Print version
-```
-
-## How mDNS Discovery Works
-
-```
-┌─────────────────┐     mDNS Broadcast      ┌─────────────────┐
-│   Application   │ ──────────────────────► │   Application   │
-│      (Peer 1)   │                         │      (Peer 2)   │
-│                 │ ◄────────────────────── │                 │
-│  Broadcasts its │     mDNS Response       │  Discovers and  │
-│   presence      │                         │   connects      │
-└─────────────────┘                         └─────────────────┘
-         │                                           │
-         │              TCP Connection               │
-         └───────────────────────────────────────────┘
-                    Encrypted Chat Messages
-```
-
-1. Each peer broadcasts its presence via mDNS (multicast DNS)
-2. Other peers on the same network discover the broadcast
-3. Discovered peers automatically connect to each other
-4. Messages are broadcast to all connected peers
-
-## Architecture
-
-```
-src/
-├── main.rs       # Application entry point and event loop
-├── lib.rs        # Library exports
-├── behaviour.rs  # libp2p network behaviour definitions
-├── config.rs     # Configuration and CLI parsing
-└── error.rs      # Error types
-```
-
-### Network Protocol
-
-The application uses the following libp2p protocols:
-
-- **Transport**: TCP with Noise encryption and Yamux multiplexing
-- **Ping**: Connection health monitoring
-- **mDNS**: Local network peer discovery (multicast DNS)
-- **Request-Response**: JSON-based messaging protocol (`/p2p-chat/1.0.0`)
-
-### Message Format
-
-```json
-// Request
-{
-  "message": "Hello, World!",
-  "timestamp": 1703596800000
-}
-
-// Response
-{
-  "ack": true,
-  "error": null
-}
-```
+- No `unsafe` code
+- Network payloads are handled as untrusted input
+- Protocol codecs enforce strict frame limits
+- CID/chunk hash fields are validated as fixed-length hex
+- RocksDB access is offloaded with `spawn_blocking`
+- Swarm is single-owner and controlled through a command channel (no shared mutable swarm across tasks)
 
 ## Development
 
-### Running Tests
-
 ```bash
-cargo test
+cargo check --all-features
+cargo test --all-features
+cargo clippy --all-features -- -D warnings
 ```
 
-### Running with Debug Logging
+## Architecture
 
-```bash
-RUST_LOG=debug cargo run -- --port 9999
-```
-
-### Code Formatting
-
-```bash
-cargo fmt
-```
-
-### Linting
-
-```bash
-cargo clippy -- -D warnings
-```
-
-## Docker (Optional)
-
-```dockerfile
-FROM rust:1.75-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
-
-FROM alpine:latest
-COPY --from=builder /app/target/release/p2p-chat /usr/local/bin/
-ENTRYPOINT ["p2p-chat"]
-```
-
-Build and run:
-
-```bash
-docker build -t p2p-chat .
-docker run -it --rm -p 9999:9999 p2p-chat --port 9999
-```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [libp2p](https://libp2p.io/) - The modular peer-to-peer networking stack
-- [Tokio](https://tokio.rs/) - Asynchronous runtime for Rust
+For a deeper runtime/protocol breakdown, see [ARCHITECTURE.md](ARCHITECTURE.md).

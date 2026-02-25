@@ -1,70 +1,25 @@
-use libp2p::futures::StreamExt;
-use libp2p::mdns;
-use libp2p::request_response::{self, Message};
-use libp2p::swarm::SwarmEvent;
-use libp2p::{noise, tcp, yamux, Multiaddr, PeerId};
-use p2p_chat::{
-    behaviour::{ChatBehaviour, ChatBehaviourEvent, MessageRequest, MessageResponse},
-    config::Config,
+use anyhow::{anyhow, Context, Result};
+use p2p_chat::config::{
+    Cli, ClientAddArgs, ClientBaseArgs, ClientCancelDownloadArgs, ClientDownloadStatusArgs,
+    ClientGetArgs, ClientProvideArgs, Command, DaemonArgs,
 };
-use std::collections::HashMap;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::{io, select, signal};
-use tracing::{debug, error, info, warn};
+use p2p_chat::control_plane::DfsControlService;
+use p2p_chat::grpc_api::dfs::control::v1::dfs_control_client::DfsControlClient;
+use p2p_chat::grpc_api::dfs::control::v1::dfs_control_server::DfsControlServer;
+use p2p_chat::grpc_api::dfs::control::v1::{
+    AddFileRequest, CancelDownloadRequest, DownloadStatusRequest, Empty, GetFileRequest,
+    ProvideRequest,
+};
+use p2p_chat::node::start_node;
+use tokio::signal;
+use tonic::transport::Server;
+use tracing::{debug, info};
 
-struct AppState {
-    peers: HashMap<PeerId, Vec<Multiaddr>>,
-    discovered_peers: HashMap<PeerId, Vec<Multiaddr>>,
-}
-
-impl AppState {
-    fn new() -> Self {
-        Self {
-            peers: HashMap::new(),
-            discovered_peers: HashMap::new(),
-        }
-    }
-
-    fn add_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        self.peers.entry(peer_id).or_default().push(addr);
-        self.discovered_peers.remove(&peer_id);
-        info!("Peer added: {} (total: {})", peer_id, self.peers.len());
-    }
-
-    fn remove_peer(&mut self, peer_id: &PeerId) {
-        self.peers.remove(peer_id);
-        info!(
-            "Peer removed: {} (remaining: {})",
-            peer_id,
-            self.peers.len()
-        );
-    }
-
-    fn add_discovered_peer(&mut self, peer_id: PeerId, addr: Multiaddr) {
-        if !self.peers.contains_key(&peer_id) {
-            self.discovered_peers.entry(peer_id).or_default().push(addr);
-        }
-    }
-
-    fn remove_discovered_peer(&mut self, peer_id: &PeerId) {
-        self.discovered_peers.remove(peer_id);
-    }
-
-    fn connected_peer_ids(&self) -> Vec<PeerId> {
-        self.peers.keys().copied().collect()
-    }
-
-    fn peer_count(&self) -> usize {
-        self.peers.len()
-    }
-}
-
-fn init_logging(config: &Config) {
-    let filter = config.log_filter();
+fn init_logging(filter: &str) {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&filter)),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
         )
         .with_target(true)
         .with_thread_ids(false)
@@ -72,356 +27,253 @@ fn init_logging(config: &Config) {
         .with_line_number(false)
         .init();
 
-    debug!("Logging initialized with filter: {}", filter);
-}
-
-fn build_swarm(config: &Config) -> anyhow::Result<libp2p::Swarm<ChatBehaviour>> {
-    let swarm = libp2p::SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_behaviour(|key_pair| {
-            let local_peer_id = key_pair.public().to_peer_id();
-            ChatBehaviour::new(local_peer_id, config.ping_interval_duration())
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-        })?
-        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(config.idle_timeout_duration()))
-        .build();
-
-    Ok(swarm)
-}
-
-fn handle_swarm_event(
-    event: SwarmEvent<ChatBehaviourEvent>,
-    swarm: &mut libp2p::Swarm<ChatBehaviour>,
-    state: &mut AppState,
-) {
-    match event {
-        SwarmEvent::NewListenAddr { address, .. } => {
-            info!("📡 Listening on {}", address);
-        }
-
-        SwarmEvent::ConnectionEstablished {
-            peer_id, endpoint, ..
-        } => {
-            let addr = endpoint.get_remote_address().clone();
-            info!("✅ Connected to peer: {} at {}", peer_id, addr);
-            state.add_peer(peer_id, addr);
-        }
-
-        SwarmEvent::ConnectionClosed {
-            peer_id,
-            cause,
-            num_established,
-            ..
-        } => {
-            if num_established == 0 {
-                warn!(
-                    "❌ Disconnected from peer: {} (cause: {:?})",
-                    peer_id, cause
-                );
-                state.remove_peer(&peer_id);
-            }
-        }
-
-        SwarmEvent::IncomingConnection {
-            local_addr,
-            send_back_addr,
-            ..
-        } => {
-            debug!(
-                "📥 Incoming connection from {} to {}",
-                send_back_addr, local_addr
-            );
-        }
-
-        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            error!(
-                "🚫 Failed to connect to {:?}: {}",
-                peer_id.map(|p| p.to_string()).unwrap_or_default(),
-                error
-            );
-        }
-
-        SwarmEvent::Behaviour(event) => {
-            handle_behaviour_event(event, swarm, state);
-        }
-
-        _ => {
-            debug!("Unhandled swarm event");
-        }
-    }
-}
-
-fn handle_behaviour_event(
-    event: ChatBehaviourEvent,
-    swarm: &mut libp2p::Swarm<ChatBehaviour>,
-    state: &mut AppState,
-) {
-    match event {
-        ChatBehaviourEvent::Ping(ping_event) => {
-            debug!("🏓 Ping event: {:?}", ping_event);
-        }
-
-        ChatBehaviourEvent::Mdns(mdns_event) => {
-            handle_mdns_event(mdns_event, swarm, state);
-        }
-
-        ChatBehaviourEvent::Messaging(msg_event) => match msg_event {
-            request_response::Event::Message { peer, message } => match message {
-                Message::Request {
-                    request, channel, ..
-                } => {
-                    info!("💬 [{}]: {}", peer, request.message);
-
-                    if let Err(e) = swarm
-                        .behaviour_mut()
-                        .messaging
-                        .send_response(channel, MessageResponse::ok())
-                    {
-                        error!("Failed to send response: {:?}", e);
-                    }
-                }
-                Message::Response { response, .. } => {
-                    if response.ack {
-                        debug!("✓ Message acknowledged by {}", peer);
-                    } else {
-                        warn!(
-                            "✗ Message not acknowledged by {}: {:?}",
-                            peer, response.error
-                        );
-                    }
-                }
-            },
-
-            request_response::Event::OutboundFailure {
-                peer,
-                error,
-                request_id,
-                ..
-            } => {
-                error!(
-                    "📤 Outbound failure to {} (request {:?}): {}",
-                    peer, request_id, error
-                );
-            }
-
-            request_response::Event::InboundFailure {
-                peer,
-                error,
-                request_id,
-                ..
-            } => {
-                error!(
-                    "📥 Inbound failure from {} (request {:?}): {}",
-                    peer, request_id, error
-                );
-            }
-
-            request_response::Event::ResponseSent { peer, request_id } => {
-                debug!("Response sent to {} for request {:?}", peer, request_id);
-            }
-        },
-    }
-}
-
-fn handle_mdns_event(
-    event: mdns::Event,
-    swarm: &mut libp2p::Swarm<ChatBehaviour>,
-    state: &mut AppState,
-) {
-    match event {
-        mdns::Event::Discovered(peers) => {
-            for (peer_id, addr) in peers {
-                info!("🔍 mDNS discovered peer: {} at {}", peer_id, addr);
-                state.add_discovered_peer(peer_id, addr.clone());
-                swarm.add_peer_address(peer_id, addr.clone());
-                if swarm.dial(addr.clone()).is_ok() {
-                    debug!("Dialing discovered peer: {}", peer_id);
-                }
-            }
-        }
-        mdns::Event::Expired(peers) => {
-            for (peer_id, addr) in peers {
-                debug!("🔍 mDNS peer expired: {} at {}", peer_id, addr);
-                state.remove_discovered_peer(&peer_id);
-            }
-        }
-    }
-}
-
-fn send_message(
-    swarm: &mut libp2p::Swarm<ChatBehaviour>,
-    state: &AppState,
-    message: String,
-    local_peer_id: &PeerId,
-) {
-    if message.trim().is_empty() {
-        return;
-    }
-
-    if message.starts_with('/') {
-        handle_command(&message, state, swarm);
-        return;
-    }
-
-    let connected_peers = state.connected_peer_ids();
-
-    if connected_peers.is_empty() {
-        warn!("⚠️  No peers connected. Waiting for connections...");
-        return;
-    }
-
-    let request = MessageRequest::new(message.clone());
-    let mut sent_count = 0;
-
-    for peer_id in &connected_peers {
-        swarm
-            .behaviour_mut()
-            .messaging
-            .send_request(peer_id, request.clone());
-        sent_count += 1;
-    }
-
-    info!(
-        "💬 [{}]: {} (sent to {} peer{})",
-        local_peer_id,
-        message,
-        sent_count,
-        if sent_count == 1 { "" } else { "s" }
-    );
-}
-
-fn handle_command(command: &str, state: &AppState, swarm: &libp2p::Swarm<ChatBehaviour>) {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-
-    match parts.first().copied() {
-        Some("/help") => {
-            println!("\n📚 Available commands:");
-            println!("  /help     - Show this help message");
-            println!("  /peers    - List connected peers");
-            println!("  /status   - Show connection status");
-            println!("  /quit     - Exit the application\n");
-        }
-        Some("/peers") => {
-            println!("\n👥 Connected peers ({}):", state.peer_count());
-            if state.peers.is_empty() {
-                println!("  No peers connected");
-            } else {
-                for (peer_id, addrs) in &state.peers {
-                    println!("  • {}", peer_id);
-                    for addr in addrs {
-                        println!("    └── {}", addr);
-                    }
-                }
-            }
-
-            if !state.discovered_peers.is_empty() {
-                println!("\n🔍 Discovered peers (not connected):");
-                for (peer_id, addrs) in &state.discovered_peers {
-                    println!("  • {}", peer_id);
-                    for addr in addrs {
-                        println!("    └── {}", addr);
-                    }
-                }
-            }
-            println!();
-        }
-        Some("/status") => {
-            let connected = state.peer_count();
-            let discovered = state.discovered_peers.len();
-            let external_addrs: Vec<_> = swarm.external_addresses().collect();
-
-            println!("\n📊 Status:");
-            println!("  Connected peers: {}", connected);
-            println!("  Discovered peers: {}", discovered);
-            println!("  External addresses: {}", external_addrs.len());
-            for addr in external_addrs {
-                println!("    └── {}", addr);
-            }
-            println!();
-        }
-        Some("/quit") => {
-            info!("👋 Goodbye!");
-            std::process::exit(0);
-        }
-        _ => {
-            println!("❓ Unknown command. Type /help for available commands.");
-        }
-    }
-}
-
-fn print_banner(local_peer_id: &PeerId, listen_addr: &str, mdns_enabled: bool) {
-    let mdns_status = if mdns_enabled { "enabled" } else { "disabled" };
-
-    println!("\n╔══════════════════════════════════════════════════════════╗");
-    println!("║                    P2P Chat Application                   ║");
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  Peer ID: {}  ║", &local_peer_id.to_string()[..46]);
-    println!("║  Listen:  {:<47} ║", listen_addr);
-    println!("║  mDNS:    {:<47} ║", mdns_status);
-    println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  Commands: /help, /peers, /status, /quit                 ║");
-    println!("╚══════════════════════════════════════════════════════════╝\n");
+    debug!("logging initialized with filter={filter}");
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let config = Config::parse_args();
-    init_logging(&config);
+async fn main() -> Result<()> {
+    let cli = Cli::parse_args();
 
-    info!("Starting P2P Chat...");
-    if config.mdns {
-        info!("mDNS peer discovery enabled");
+    match cli.command {
+        Command::Daemon(args) => run_daemon(args).await,
+        Command::Add(args) => run_add(args).await,
+        Command::Provide(args) => run_provide(args).await,
+        Command::Get(args) => run_get(args).await,
+        Command::List(args) => run_list(args).await,
+        Command::Status(args) => run_status(args).await,
+        Command::DownloadStatus(args) => run_download_status(args).await,
+        Command::CancelDownload(args) => run_cancel_download(args).await,
+        Command::Peers(args) => run_peers(args).await,
     }
+}
 
-    let mut swarm = build_swarm(&config)?;
-    let local_peer_id = *swarm.local_peer_id();
+async fn run_daemon(args: DaemonArgs) -> Result<()> {
+    init_logging(&args.log_filter());
 
-    let listen_addr: Multiaddr = config.listen_addr().parse()?;
-    swarm.listen_on(listen_addr)?;
+    let (handle, mut runtime_task) = start_node(args.clone()).await?;
+    let service = DfsControlService::new(handle.client());
+    let mut grpc_shutdown_rx = handle.shutdown_receiver();
 
-    if let Some(ref peer) = config.peer {
-        info!("Dialing peer: {}", peer);
-        swarm.dial(peer.clone())?;
-    }
+    let grpc_addr = args.grpc_addr;
+    let grpc_server = Server::builder()
+        .add_service(DfsControlServer::new(service))
+        .serve_with_shutdown(grpc_addr, async move {
+            loop {
+                if *grpc_shutdown_rx.borrow() {
+                    break;
+                }
 
-    print_banner(&local_peer_id, &config.listen_addr(), config.mdns);
-
-    let mut state = AppState::new();
-    let mut stdin = BufReader::new(io::stdin()).lines();
-
-    loop {
-        select! {
-            event = swarm.select_next_some() => {
-                handle_swarm_event(event, &mut swarm, &mut state);
-            }
-
-            line = stdin.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        send_message(&mut swarm, &state, line, &local_peer_id);
-                    }
-                    Ok(None) => {
-                        info!("👋 EOF received, shutting down...");
-                        break;
-                    }
-                    Err(e) => {
-                        error!("Error reading stdin: {}", e);
-                    }
+                if grpc_shutdown_rx.changed().await.is_err() {
+                    break;
                 }
             }
+        });
 
-            _ = signal::ctrl_c() => {
-                info!("👋 Received Ctrl+C, shutting down gracefully...");
-                break;
-            }
+    let mut grpc_task = tokio::spawn(async move {
+        grpc_server
+            .await
+            .with_context(|| format!("gRPC server failed on {grpc_addr}"))
+    });
+
+    info!(
+        "daemon started: p2p_listen={} grpc_addr={}",
+        args.listen_p2p, args.grpc_addr
+    );
+
+    let mut runtime_result: Option<Result<()>> = None;
+    let mut grpc_result: Option<Result<()>> = None;
+
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("received Ctrl+C, shutting down daemon");
+        }
+        result = &mut runtime_task => {
+            runtime_result = Some(
+                result
+                    .map_err(|error| anyhow!("runtime task join error: {error}"))?
+            );
+        }
+        result = &mut grpc_task => {
+            grpc_result = Some(
+                result
+                    .map_err(|error| anyhow!("gRPC task join error: {error}"))?
+            );
         }
     }
 
-    info!("P2P Chat shutdown complete");
+    handle.shutdown()?;
+
+    if runtime_result.is_none() {
+        runtime_result = Some(
+            runtime_task
+                .await
+                .map_err(|error| anyhow!("runtime task join error: {error}"))?,
+        );
+    }
+
+    if grpc_result.is_none() {
+        grpc_result = Some(
+            grpc_task
+                .await
+                .map_err(|error| anyhow!("gRPC task join error: {error}"))?,
+        );
+    }
+
+    if let Some(result) = grpc_result {
+        result?;
+    }
+
+    if let Some(result) = runtime_result {
+        result?;
+    }
+
+    info!("daemon shutdown complete");
     Ok(())
+}
+
+async fn run_add(args: ClientAddArgs) -> Result<()> {
+    let mut client = connect_client(&args.base).await?;
+    let response = client
+        .add_file(AddFileRequest {
+            path: args.path.display().to_string(),
+            public: args.public,
+        })
+        .await?
+        .into_inner();
+
+    println!("{}", response.cid);
+    Ok(())
+}
+
+async fn run_provide(args: ClientProvideArgs) -> Result<()> {
+    let mut client = connect_client(&args.base).await?;
+    client
+        .provide(ProvideRequest { cid: args.cid })
+        .await
+        .map_err(|error| anyhow!("Provide request failed: {error}"))?;
+
+    println!("accepted");
+    Ok(())
+}
+
+async fn run_get(args: ClientGetArgs) -> Result<()> {
+    let mut client = connect_client(&args.base).await?;
+    client
+        .get_file(GetFileRequest {
+            cid: args.cid,
+            output_path: args.output.display().to_string(),
+        })
+        .await
+        .map_err(|error| anyhow!("GetFile request failed: {error}"))?;
+
+    println!("accepted");
+    Ok(())
+}
+
+async fn run_list(args: ClientBaseArgs) -> Result<()> {
+    let mut client = connect_client(&args).await?;
+    let response = client
+        .list_local(Empty {})
+        .await
+        .map_err(|error| anyhow!("ListLocal request failed: {error}"))?
+        .into_inner();
+
+    for cid in response.cids {
+        println!("{cid}");
+    }
+
+    Ok(())
+}
+
+async fn run_status(args: ClientBaseArgs) -> Result<()> {
+    let mut client = connect_client(&args).await?;
+    let response = client
+        .status(Empty {})
+        .await
+        .map_err(|error| anyhow!("Status request failed: {error}"))?
+        .into_inner();
+
+    println!("peer_id: {}", response.peer_id);
+    println!("listen_addrs: {}", response.listen_addrs.join(", "));
+    println!("connected_peers: {}", response.connected_peers);
+    println!("known_peers: {}", response.known_peers);
+    println!("mdns_enabled: {}", response.mdns_enabled);
+    println!("announcements_enabled: {}", response.announcements_enabled);
+    println!("local_file_count: {}", response.local_file_count);
+    println!("providing_count: {}", response.providing_count);
+    println!("active_downloads: {}", response.active_downloads);
+
+    Ok(())
+}
+
+async fn run_download_status(args: ClientDownloadStatusArgs) -> Result<()> {
+    let mut client = connect_client(&args.base).await?;
+    let response = client
+        .download_status(DownloadStatusRequest { cid: args.cid })
+        .await
+        .map_err(|error| anyhow!("DownloadStatus request failed: {error}"))?
+        .into_inner();
+
+    println!("cid: {}", response.cid);
+    println!("phase: {}", response.phase);
+    println!(
+        "completed_chunks: {}/{}",
+        response.completed_chunks, response.total_chunks
+    );
+    println!("output_path: {}", response.output_path);
+    if !response.error.is_empty() {
+        println!("error: {}", response.error);
+    }
+
+    Ok(())
+}
+
+async fn run_cancel_download(args: ClientCancelDownloadArgs) -> Result<()> {
+    let mut client = connect_client(&args.base).await?;
+    let response = client
+        .cancel_download(CancelDownloadRequest { cid: args.cid })
+        .await
+        .map_err(|error| anyhow!("CancelDownload request failed: {error}"))?
+        .into_inner();
+
+    println!("cancelled: {}", response.cancelled);
+    Ok(())
+}
+
+async fn run_peers(args: ClientBaseArgs) -> Result<()> {
+    let mut client = connect_client(&args).await?;
+    let response = client
+        .peers(Empty {})
+        .await
+        .map_err(|error| anyhow!("Peers request failed: {error}"))?
+        .into_inner();
+
+    for peer in response.peers {
+        println!(
+            "peer={} connected={} dialing={} addrs=[{}]",
+            peer.peer_id,
+            peer.connected,
+            peer.dialing,
+            peer.addresses.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+async fn connect_client(
+    base: &ClientBaseArgs,
+) -> Result<DfsControlClient<tonic::transport::Channel>> {
+    let endpoint = normalize_endpoint(&base.grpc_addr);
+    DfsControlClient::connect(endpoint)
+        .await
+        .map_err(|error| anyhow!("failed to connect to local daemon: {error}"))
+}
+
+fn normalize_endpoint(endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
 }

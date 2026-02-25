@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum ChatError {
+pub enum NodeError {
     #[error("Network error: {0}")]
     Network(#[from] libp2p::TransportError<std::io::Error>),
 
@@ -27,16 +27,16 @@ pub enum ChatError {
     Other(String),
 }
 
-pub type Result<T> = std::result::Result<T, ChatError>;
+pub type Result<T> = std::result::Result<T, NodeError>;
 
-impl From<String> for ChatError {
+impl From<String> for NodeError {
     fn from(s: String) -> Self {
-        ChatError::Other(s)
+        NodeError::Other(s)
     }
 }
 
-impl From<&str> for ChatError {
+impl From<&str> for NodeError {
     fn from(s: &str) -> Self {
-        ChatError::Other(s.to_string())
+        NodeError::Other(s.to_string())
     }
 }

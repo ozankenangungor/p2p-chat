@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package dfs.control.v1;
+
+service DfsControl {
+  rpc AddFile(AddFileRequest) returns (AddFileResponse);
+  rpc Provide(ProvideRequest) returns (ProvideResponse);
+  rpc GetFile(GetFileRequest) returns (GetFileResponse);
+  rpc ListLocal(Empty) returns (ListLocalResponse);
+  rpc ListProviding(Empty) returns (ListProvidingResponse);
+  rpc DownloadStatus(DownloadStatusRequest) returns (DownloadStatusResponse);
+  rpc CancelDownload(CancelDownloadRequest) returns (CancelDownloadResponse);
+  rpc Peers(Empty) returns (PeersResponse);
+  rpc Status(Empty) returns (StatusResponse);
+}
+
+message Empty {}
+
+message AddFileRequest {
+  string path = 1;
+  bool public = 2;
+}
+
+message AddFileResponse {
+  string cid = 1;
+}
+
+message ProvideRequest {
+  string cid = 1;
+}
+
+message ProvideResponse {
+  bool accepted = 1;
+}
+
+message GetFileRequest {
+  string cid = 1;
+  string output_path = 2;
+}
+
+message GetFileResponse {
+  bool accepted = 1;
+}
+
+message ListLocalResponse {
+  repeated string cids = 1;
+}
+
+message ListProvidingResponse {
+  repeated string cids = 1;
+}
+
+message DownloadStatusRequest {
+  string cid = 1;
+}
+
+message DownloadStatusResponse {
+  string cid = 1;
+  string phase = 2;
+  uint32 total_chunks = 3;
+  uint32 completed_chunks = 4;
+  string output_path = 5;
+  string error = 6;
+}
+
+message CancelDownloadRequest {
+  string cid = 1;
+}
+
+message CancelDownloadResponse {
+  bool cancelled = 1;
+}
+
+message PeerEntry {
+  string peer_id = 1;
+  repeated string addresses = 2;
+  bool connected = 3;
+  bool dialing = 4;
+}
+
+message PeersResponse {
+  repeated PeerEntry peers = 1;
+}
+
+message StatusResponse {
+  string peer_id = 1;
+  repeated string listen_addrs = 2;
+  uint32 connected_peers = 3;
+  uint32 known_peers = 4;
+  bool mdns_enabled = 5;
+  bool announcements_enabled = 6;
+  uint32 local_file_count = 7;
+  uint32 providing_count = 8;
+  uint32 active_downloads = 9;
+}

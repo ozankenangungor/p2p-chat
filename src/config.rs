@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use libp2p::Multiaddr;
 use std::net::SocketAddr;
@@ -17,7 +18,7 @@ pub const DEFAULT_PUBLIC_TOPIC: &str = "dfs.public.announcements";
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "p2p-chat",
+    name = "p2p-dfs-node",
     author,
     version,
     about = "Production-grade libp2p DFS node",
@@ -33,6 +34,7 @@ pub enum Command {
     Daemon(DaemonArgs),
     Add(ClientAddArgs),
     Provide(ClientProvideArgs),
+    Providing(ClientBaseArgs),
     Get(ClientGetArgs),
     List(ClientBaseArgs),
     Status(ClientBaseArgs),
@@ -48,6 +50,14 @@ pub struct DaemonArgs {
 
     #[arg(long, env = "DFS_GRPC_ADDR", default_value = DEFAULT_GRPC_ADDR)]
     pub grpc_addr: SocketAddr,
+
+    #[arg(
+        long,
+        env = "DFS_ALLOW_REMOTE_CONTROL",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    pub allow_remote_control: bool,
 
     #[arg(long = "peer", env = "DFS_PEERS")]
     pub peers: Vec<Multiaddr>,
@@ -118,6 +128,21 @@ pub struct DaemonArgs {
 }
 
 impl DaemonArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.chunk_size == 0 {
+            bail!("chunk_size must be greater than zero");
+        }
+
+        if !self.allow_remote_control && !self.grpc_addr.ip().is_loopback() {
+            bail!(
+                "refusing to expose gRPC control plane on {} without --allow-remote-control",
+                self.grpc_addr
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn dial_cooldown(&self) -> Duration {
         Duration::from_secs(self.dial_cooldown_secs)
     }
@@ -215,6 +240,7 @@ mod tests {
         let args = DaemonArgs {
             listen_p2p,
             grpc_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 50051)),
+            allow_remote_control: false,
             peers: Vec::new(),
             mdns: false,
             key_file: PathBuf::from("./node_key"),
@@ -237,5 +263,69 @@ mod tests {
     #[test]
     fn default_chunk_size_constant_is_expected() {
         assert_eq!(DEFAULT_CHUNK_SIZE, 256 * 1024);
+    }
+
+    #[test]
+    fn daemon_validation_rejects_non_loopback_grpc_by_default() {
+        let listen_p2p = "/ip4/0.0.0.0/tcp/0".parse();
+        assert!(listen_p2p.is_ok());
+        let listen_p2p = match listen_p2p {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+
+        let args = DaemonArgs {
+            listen_p2p,
+            grpc_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 50051)),
+            allow_remote_control: false,
+            peers: Vec::new(),
+            mdns: false,
+            key_file: PathBuf::from("./node_key"),
+            db_path: PathBuf::from("./db"),
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            metadata_max_bytes: DEFAULT_METADATA_MAX_BYTES,
+            global_download_concurrency: 16,
+            per_peer_concurrency: 3,
+            dial_cooldown_secs: 10,
+            reprovide_interval_secs: 30,
+            enable_public_announcements: false,
+            public_topic: "dfs.public.announcements".to_string(),
+            log_level: "info".to_string(),
+            verbose: false,
+        };
+
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn daemon_validation_allows_non_loopback_when_explicitly_enabled() {
+        let listen_p2p = "/ip4/0.0.0.0/tcp/0".parse();
+        assert!(listen_p2p.is_ok());
+        let listen_p2p = match listen_p2p {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+
+        let args = DaemonArgs {
+            listen_p2p,
+            grpc_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 50051)),
+            allow_remote_control: true,
+            peers: Vec::new(),
+            mdns: false,
+            key_file: PathBuf::from("./node_key"),
+            db_path: PathBuf::from("./db"),
+            chunk_size: DEFAULT_CHUNK_SIZE,
+            metadata_max_bytes: DEFAULT_METADATA_MAX_BYTES,
+            global_download_concurrency: 16,
+            per_peer_concurrency: 3,
+            dial_cooldown_secs: 10,
+            reprovide_interval_secs: 30,
+            enable_public_announcements: false,
+            public_topic: "dfs.public.announcements".to_string(),
+            log_level: "info".to_string(),
+            verbose: false,
+        };
+
+        assert!(args.validate().is_ok());
     }
 }

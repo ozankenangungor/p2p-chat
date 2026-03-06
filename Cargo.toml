@@ -1,11 +1,11 @@
 [package]
-name = "p2p-chat"
+name = "p2p-dfs-node"
 version = "0.1.0"
 edition = "2021"
 authors = ["ozankenangungor"]
 description = "A production-ready libp2p DFS node with local gRPC control plane"
 license = "MIT"
-repository = "https://github.com/ozankenangungor/p2p-chat"
+repository = "https://github.com/ozankenangungor/p2p-dfs-node"
 readme = "README.md"
 keywords = ["p2p", "dfs", "libp2p", "networking"]
 categories = ["network-programming"]
@@ -63,5 +63,5 @@ panic = "abort"
 strip = true
 
 [[bin]]
-name = "p2p-chat"
+name = "p2p-dfs-node"
 path = "src/main.rs"

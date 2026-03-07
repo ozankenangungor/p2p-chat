@@ -583,8 +583,8 @@ impl NodeRuntime {
     }
 
     async fn build_status_snapshot(&mut self) -> Result<NodeStatusSnapshot> {
-        let local_file_count = self.store.list_local().await?.len();
-        let providing_count = self.store.list_providing().await?.len();
+        let local_file_count = self.store.count_local().await?;
+        let providing_count = self.store.count_providing().await?;
 
         Ok(NodeStatusSnapshot {
             peer_id: self.local_peer_id,

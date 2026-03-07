@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use libp2p::PeerId;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,7 @@ pub struct DownloadConfig {
     pub global_concurrency: usize,
     pub per_peer_concurrency: usize,
     pub max_retries: u32,
+    pub provider_discovery_retries: u32,
 }
 
 impl Default for DownloadConfig {
@@ -27,6 +29,7 @@ impl Default for DownloadConfig {
             global_concurrency: 16,
             per_peer_concurrency: 3,
             max_retries: 4,
+            provider_discovery_retries: 8,
         }
     }
 }
@@ -91,17 +94,24 @@ async fn run_download_inner(
         .unwrap_or_else(|| DownloadProgress::new(cid.clone(), output_path.clone()));
     progress.output_path = output_path.clone();
     progress.phase = DownloadPhase::DiscoveringProviders;
+    progress.retries = 0;
     progress.updated_unix_ms = now_unix_ms();
     store.put_download_progress(&progress).await?;
 
-    let providers = client.find_providers(cid.clone()).await?;
-    if providers.is_empty() {
-        bail!("no providers found for cid {cid}");
-    }
+    let providers = find_providers_with_retry(
+        &client,
+        &cid,
+        config.provider_discovery_retries,
+        cancel_rx,
+        &mut progress,
+        &store,
+    )
+    .await?;
 
     ensure_not_cancelled(cancel_rx)?;
 
     progress.phase = DownloadPhase::FetchingManifest;
+    progress.retries = 0;
     progress.updated_unix_ms = now_unix_ms();
     store.put_download_progress(&progress).await?;
 
@@ -133,6 +143,7 @@ async fn run_download_inner(
 
     progress.phase = DownloadPhase::DownloadingChunks;
     progress.error = None;
+    progress.retries = 0;
     progress.updated_unix_ms = now_unix_ms();
     store.put_download_progress(&progress).await?;
 
@@ -153,7 +164,7 @@ async fn run_download_inner(
     progress.updated_unix_ms = now_unix_ms();
     store.put_download_progress(&progress).await?;
 
-    assemble_file(&store, &manifest, &cid, &output_path).await?;
+    assemble_file(&store, &manifest, &cid, &output_path, cancel_rx).await?;
 
     progress.phase = DownloadPhase::Completed;
     progress.error = None;
@@ -161,6 +172,32 @@ async fn run_download_inner(
     store.put_download_progress(&progress).await?;
 
     Ok(())
+}
+
+async fn find_providers_with_retry(
+    client: &NodeClient,
+    cid: &str,
+    max_retries: u32,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress: &mut DownloadProgress,
+    store: &RocksStore,
+) -> Result<Vec<PeerId>> {
+    for retry in 0..=max_retries {
+        let providers = run_cancellable(cancel_rx, client.find_providers(cid.to_string())).await?;
+        if !providers.is_empty() {
+            return Ok(providers);
+        }
+
+        progress.retries = retry.saturating_add(1);
+        progress.updated_unix_ms = now_unix_ms();
+        store.put_download_progress(progress).await?;
+
+        if retry < max_retries {
+            sleep_or_cancel(backoff_duration(retry), cancel_rx).await?;
+        }
+    }
+
+    Err(anyhow!("no providers found for cid {cid}"))
 }
 
 async fn fetch_manifest_with_retry(
@@ -175,10 +212,10 @@ async fn fetch_manifest_with_retry(
     let mut last_error = anyhow!("no providers attempted");
 
     for retry in 0..=max_retries {
-        ensure_not_cancelled(cancel_rx)?;
-
         for provider in providers {
-            match client.fetch_manifest(*provider, cid.to_string()).await {
+            match run_cancellable(cancel_rx, client.fetch_manifest(*provider, cid.to_string()))
+                .await
+            {
                 Ok(manifest) => {
                     validate_manifest_cid(&manifest, cid)?;
                     return Ok(manifest);
@@ -197,7 +234,7 @@ async fn fetch_manifest_with_retry(
         store.put_download_progress(progress).await?;
 
         if retry < max_retries {
-            tokio::time::sleep(backoff_duration(retry)).await;
+            sleep_or_cancel(backoff_duration(retry), cancel_rx).await?;
         }
     }
 
@@ -209,7 +246,7 @@ async fn download_chunks(
     store: &RocksStore,
     manifest: &Manifest,
     providers: &[PeerId],
-    cancel_rx: &watch::Receiver<bool>,
+    cancel_rx: &mut watch::Receiver<bool>,
     config: &DownloadConfig,
     progress: &mut DownloadProgress,
 ) -> Result<()> {
@@ -226,6 +263,8 @@ async fn download_chunks(
     let mut cursor = 0_usize;
 
     while cursor < pending_indices.len() || !join_set.is_empty() {
+        ensure_not_cancelled(cancel_rx)?;
+
         while cursor < pending_indices.len() && join_set.len() < global_limit {
             let index = pending_indices[cursor];
             cursor += 1;
@@ -265,7 +304,24 @@ async fn download_chunks(
             });
         }
 
-        if let Some(result) = join_set.join_next().await {
+        if join_set.is_empty() {
+            continue;
+        }
+
+        let result = tokio::select! {
+            result = join_set.join_next(), if !join_set.is_empty() => result,
+            changed = cancel_rx.changed() => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    join_set.abort_all();
+                    while join_set.join_next().await.is_some() {}
+                    bail!(DownloadCancelled);
+                }
+
+                None
+            }
+        };
+
+        if let Some(result) = result {
             let (index, chunk_hash, bytes) =
                 result.map_err(|error| anyhow!("chunk worker join failure: {error}"))??;
 
@@ -330,8 +386,6 @@ async fn fetch_chunk_with_retry(
     let mut last_error = anyhow!("unable to fetch chunk");
 
     for retry in 0..=max_retries {
-        ensure_not_cancelled(cancel_rx)?;
-
         for offset in 0..providers.len() {
             let provider_index =
                 (chunk_index + offset + usize::try_from(retry).unwrap_or(0)) % providers.len();
@@ -353,7 +407,8 @@ async fn fetch_chunk_with_retry(
                 .await
                 .map_err(|_| anyhow!("peer semaphore closed"))?;
 
-            match client.fetch_chunk(peer, chunk_hash.to_string()).await {
+            match run_cancellable(cancel_rx, client.fetch_chunk(peer, chunk_hash.to_string())).await
+            {
                 Ok(bytes) => {
                     if hash_bytes_hex(&bytes) != chunk_hash {
                         last_error = anyhow!("received invalid chunk hash from provider {peer}");
@@ -369,7 +424,7 @@ async fn fetch_chunk_with_retry(
         }
 
         if retry < max_retries {
-            tokio::time::sleep(backoff_duration(retry)).await;
+            sleep_or_cancel(backoff_duration(retry), cancel_rx).await?;
         }
     }
 
@@ -381,6 +436,7 @@ async fn assemble_file(
     manifest: &Manifest,
     cid: &str,
     output_path: &PathBuf,
+    cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     if let Some(parent) = output_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -388,31 +444,53 @@ async fn assemble_file(
 
     let short_cid: String = cid.chars().take(8).collect();
     let temp_path = output_path.with_extension(format!("{short_cid}.part"));
-    let mut temp_file = tokio::fs::File::create(&temp_path)
-        .await
-        .with_context(|| format!("failed to create temporary file {}", temp_path.display()))?;
+    let result: Result<()> = async {
+        let mut temp_file = tokio::fs::File::create(&temp_path)
+            .await
+            .with_context(|| format!("failed to create temporary file {}", temp_path.display()))?;
+        let mut written_len = 0_u64;
 
-    for hash in &manifest.chunk_hashes {
-        let chunk = store
-            .get_chunk(hash)
-            .await?
-            .ok_or_else(|| anyhow!("missing chunk {hash} during assembly"))?;
+        for hash in &manifest.chunk_hashes {
+            ensure_not_cancelled(cancel_rx)?;
 
-        if hash_bytes_hex(&chunk) != *hash {
-            bail!("chunk hash mismatch while assembling file");
+            let chunk = store
+                .get_chunk(hash)
+                .await?
+                .ok_or_else(|| anyhow!("missing chunk {hash} during assembly"))?;
+
+            if hash_bytes_hex(&chunk) != *hash {
+                bail!("chunk hash mismatch while assembling file");
+            }
+
+            temp_file.write_all(&chunk).await?;
+            written_len = written_len.saturating_add(u64::try_from(chunk.len())?);
         }
 
-        temp_file.write_all(&chunk).await?;
+        if written_len != manifest.file_len {
+            bail!(
+                "assembled file length mismatch: expected {}, got {}",
+                manifest.file_len,
+                written_len
+            );
+        }
+
+        temp_file.flush().await?;
+        temp_file.sync_all().await?;
+
+        if tokio::fs::try_exists(output_path).await? {
+            tokio::fs::remove_file(output_path).await?;
+        }
+
+        tokio::fs::rename(&temp_path, output_path).await?;
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() && tokio::fs::try_exists(&temp_path).await.unwrap_or(false) {
+        let _ = tokio::fs::remove_file(&temp_path).await;
     }
 
-    temp_file.flush().await?;
-    temp_file.sync_all().await?;
-
-    if tokio::fs::try_exists(output_path).await? {
-        tokio::fs::remove_file(output_path).await?;
-    }
-
-    tokio::fs::rename(&temp_path, output_path).await?;
+    result?;
 
     let root = compute_merkle_root_hex(&manifest.chunk_hashes)?;
     if root != cid {
@@ -428,6 +506,40 @@ fn ensure_not_cancelled(cancel_rx: &watch::Receiver<bool>) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_cancellable<T, Fut>(cancel_rx: &mut watch::Receiver<bool>, future: Fut) -> Result<T>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    ensure_not_cancelled(cancel_rx)?;
+    tokio::pin!(future);
+
+    tokio::select! {
+        result = &mut future => result,
+        changed = cancel_rx.changed() => {
+            match changed {
+                Ok(()) if *cancel_rx.borrow() => bail!(DownloadCancelled),
+                Ok(()) => bail!(DownloadCancelled),
+                Err(_) => bail!(DownloadCancelled),
+            }
+        }
+    }
+}
+
+async fn sleep_or_cancel(duration: Duration, cancel_rx: &mut watch::Receiver<bool>) -> Result<()> {
+    ensure_not_cancelled(cancel_rx)?;
+
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => Ok(()),
+        changed = cancel_rx.changed() => {
+            match changed {
+                Ok(()) if *cancel_rx.borrow() => bail!(DownloadCancelled),
+                Ok(()) => bail!(DownloadCancelled),
+                Err(_) => bail!(DownloadCancelled),
+            }
+        }
+    }
 }
 
 fn backoff_duration(retry: u32) -> Duration {

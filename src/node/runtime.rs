@@ -1,15 +1,15 @@
+use super::client::{NodeClient, NodeCommand};
+use super::peer_state::{peer_id_from_multiaddr, PeerState};
+use super::NodeStatusSnapshot;
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::config::DaemonArgs;
 use crate::download::{run_download, DownloadConfig};
-use crate::identity::load_or_create_identity;
 use crate::manifest::Manifest;
 use crate::protocol::{
     chunk_bytes, chunk_response_from_bytes, ChunkRequest, ChunkResponse, MetadataRequest,
     MetadataResponse,
 };
-use crate::storage::{
-    now_unix_ms, DownloadPhase, DownloadProgress, ProvideState, RocksStorageConfig, RocksStore,
-};
+use crate::storage::{now_unix_ms, DownloadPhase, ProvideState, RocksStore};
 use crate::validation::{validate_chunk_hash_hex, validate_cid_hex};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -17,348 +17,17 @@ use libp2p::futures::StreamExt;
 use libp2p::gossipsub;
 use libp2p::kad::{self, QueryId, QueryResult};
 use libp2p::mdns;
-use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, Message, OutboundRequestId};
 use libp2p::swarm::SwarmEvent;
-use libp2p::{noise, tcp, yamux, Multiaddr, PeerId, Swarm};
+use libp2p::{Multiaddr, PeerId, Swarm};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
-const COMMAND_CHANNEL_CAPACITY: usize = 256;
-const SWARM_IDLE_TIMEOUT_SECS: u64 = 60;
-
-#[derive(Debug, Clone)]
-pub struct NodeStatusSnapshot {
-    pub peer_id: PeerId,
-    pub listen_addrs: Vec<Multiaddr>,
-    pub connected_peers: usize,
-    pub known_peers: usize,
-    pub mdns_enabled: bool,
-    pub announcements_enabled: bool,
-    pub local_file_count: usize,
-    pub providing_count: usize,
-    pub active_downloads: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct PeerSnapshot {
-    pub peer_id: PeerId,
-    pub addresses: Vec<Multiaddr>,
-    pub connected: bool,
-    pub dialing: bool,
-}
-
-#[derive(Clone)]
-pub struct NodeClient {
-    command_tx: mpsc::Sender<NodeCommand>,
-}
-
-pub struct NodeHandle {
-    client: NodeClient,
-    shutdown_tx: watch::Sender<bool>,
-}
-
-impl NodeHandle {
-    pub fn client(&self) -> NodeClient {
-        self.client.clone()
-    }
-
-    pub fn shutdown_receiver(&self) -> watch::Receiver<bool> {
-        self.shutdown_tx.subscribe()
-    }
-
-    pub fn shutdown(&self) -> Result<()> {
-        self.shutdown_tx
-            .send(true)
-            .map_err(|error| anyhow!("failed to broadcast shutdown: {error}"))
-    }
-}
-
-impl NodeClient {
-    pub fn new(command_tx: mpsc::Sender<NodeCommand>) -> Self {
-        Self { command_tx }
-    }
-
-    pub async fn add_file(&self, path: PathBuf, public: bool) -> Result<String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::AddFile {
-                path,
-                public,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|error| anyhow!("failed to send AddFile command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("AddFile response dropped: {error}"))?
-    }
-
-    pub async fn provide(&self, cid: String) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::Provide {
-                cid,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|error| anyhow!("failed to send Provide command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("Provide response dropped: {error}"))?
-    }
-
-    pub async fn list_local(&self) -> Result<Vec<String>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::ListLocal { reply: reply_tx })
-            .await
-            .map_err(|error| anyhow!("failed to send ListLocal command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("ListLocal response dropped: {error}"))?
-    }
-
-    pub async fn list_providing(&self) -> Result<Vec<String>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::ListProviding { reply: reply_tx })
-            .await
-            .map_err(|error| anyhow!("failed to send ListProviding command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("ListProviding response dropped: {error}"))?
-    }
-
-    pub async fn status(&self) -> Result<NodeStatusSnapshot> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::Status { reply: reply_tx })
-            .await
-            .map_err(|error| anyhow!("failed to send Status command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("Status response dropped: {error}"))?
-    }
-
-    pub async fn peers(&self) -> Result<Vec<PeerSnapshot>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::Peers { reply: reply_tx })
-            .await
-            .map_err(|error| anyhow!("failed to send Peers command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("Peers response dropped: {error}"))?
-    }
-
-    pub async fn start_download(&self, cid: String, output_path: PathBuf) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::StartDownload {
-                cid,
-                output_path,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|error| anyhow!("failed to send StartDownload command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("StartDownload response dropped: {error}"))?
-    }
-
-    pub async fn download_status(&self, cid: String) -> Result<Option<DownloadProgress>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::DownloadStatus {
-                cid,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|error| anyhow!("failed to send DownloadStatus command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("DownloadStatus response dropped: {error}"))?
-    }
-
-    pub async fn cancel_download(&self, cid: String) -> Result<bool> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::CancelDownload {
-                cid,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|error| anyhow!("failed to send CancelDownload command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("CancelDownload response dropped: {error}"))?
-    }
-
-    pub async fn find_providers(&self, cid: String) -> Result<Vec<PeerId>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::FindProviders {
-                cid,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|error| anyhow!("failed to send FindProviders command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("FindProviders response dropped: {error}"))?
-    }
-
-    pub async fn fetch_manifest(&self, peer: PeerId, cid: String) -> Result<Manifest> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::FetchManifest {
-                peer,
-                cid,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|error| anyhow!("failed to send FetchManifest command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("FetchManifest response dropped: {error}"))?
-    }
-
-    pub async fn fetch_chunk(&self, peer: PeerId, chunk_hash: String) -> Result<Bytes> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.command_tx
-            .send(NodeCommand::FetchChunk {
-                peer,
-                chunk_hash,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|error| anyhow!("failed to send FetchChunk command: {error}"))?;
-        reply_rx
-            .await
-            .map_err(|error| anyhow!("FetchChunk response dropped: {error}"))?
-    }
-}
-
-pub enum NodeCommand {
-    AddFile {
-        path: PathBuf,
-        public: bool,
-        reply: oneshot::Sender<Result<String>>,
-    },
-    ListLocal {
-        reply: oneshot::Sender<Result<Vec<String>>>,
-    },
-    Provide {
-        cid: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    ListProviding {
-        reply: oneshot::Sender<Result<Vec<String>>>,
-    },
-    Status {
-        reply: oneshot::Sender<Result<NodeStatusSnapshot>>,
-    },
-    Peers {
-        reply: oneshot::Sender<Result<Vec<PeerSnapshot>>>,
-    },
-    FindProviders {
-        cid: String,
-        reply: oneshot::Sender<Result<Vec<PeerId>>>,
-    },
-    FetchManifest {
-        peer: PeerId,
-        cid: String,
-        reply: oneshot::Sender<Result<Manifest>>,
-    },
-    FetchChunk {
-        peer: PeerId,
-        chunk_hash: String,
-        reply: oneshot::Sender<Result<Bytes>>,
-    },
-    StartDownload {
-        cid: String,
-        output_path: PathBuf,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    DownloadStatus {
-        cid: String,
-        reply: oneshot::Sender<Result<Option<DownloadProgress>>>,
-    },
-    CancelDownload {
-        cid: String,
-        reply: oneshot::Sender<Result<bool>>,
-    },
-    DownloadFinished {
-        cid: String,
-    },
-}
-
-pub async fn start_node(
-    args: DaemonArgs,
-) -> Result<(NodeHandle, tokio::task::JoinHandle<Result<()>>)> {
-    let identity = load_or_create_identity(&args.key_file)
-        .await
-        .with_context(|| format!("failed to load identity from {}", args.key_file.display()))?;
-
-    let store = RocksStore::open(RocksStorageConfig {
-        path: args.db_path.clone(),
-        ..RocksStorageConfig::default()
-    })
-    .await
-    .with_context(|| format!("failed to open RocksDB at {}", args.db_path.display()))?;
-
-    let mut swarm = build_swarm(&identity, &args)?;
-    swarm
-        .listen_on(args.listen_p2p.clone())
-        .with_context(|| format!("failed to listen on {}", args.listen_p2p))?;
-
-    let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    let runtime = NodeRuntime::new(args, store, swarm, command_rx, command_tx.clone());
-    let runtime_task = tokio::spawn(async move { runtime.run(shutdown_rx).await });
-
-    Ok((
-        NodeHandle {
-            client: NodeClient::new(command_tx),
-            shutdown_tx,
-        },
-        runtime_task,
-    ))
-}
-
-fn build_swarm(
-    identity: &libp2p::identity::Keypair,
-    args: &DaemonArgs,
-) -> Result<Swarm<NodeBehaviour>> {
-    let behaviour_args = args.clone();
-
-    let swarm = libp2p::SwarmBuilder::with_existing_identity(identity.clone())
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_behaviour(move |keypair| {
-            NodeBehaviour::new(keypair, &behaviour_args)
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
-        })?
-        .with_swarm_config(|config| {
-            config.with_idle_connection_timeout(Duration::from_secs(SWARM_IDLE_TIMEOUT_SECS))
-        })
-        .build();
-
-    Ok(swarm)
-}
-
-struct NodeRuntime {
+pub(super) struct NodeRuntime {
     args: DaemonArgs,
     swarm: Swarm<NodeBehaviour>,
     store: RocksStore,
@@ -383,8 +52,15 @@ struct PendingProvide {
     sender: Option<oneshot::Sender<Result<()>>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PublicAnnouncement {
+    cid: String,
+    file_len: u64,
+    chunk_size: u32,
+}
+
 impl NodeRuntime {
-    fn new(
+    pub(super) fn new(
         args: DaemonArgs,
         store: RocksStore,
         swarm: Swarm<NodeBehaviour>,
@@ -415,7 +91,7 @@ impl NodeRuntime {
         runtime
     }
 
-    async fn run(mut self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
+    pub(super) async fn run(mut self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         info!("node runtime started: peer_id={}", self.local_peer_id);
 
         let mut reprovide_timer = interval(self.args.reprovide_interval());
@@ -776,7 +452,7 @@ impl NodeRuntime {
                 let _ = reply.send(result);
             }
             NodeCommand::Provide { cid, reply } => {
-                let result = self.begin_provide(cid, Some(reply));
+                let result = self.begin_provide(cid, Some(reply)).await;
                 if let Err(error) = result {
                     warn!("provide command failed before query start: {error:#}");
                 }
@@ -907,8 +583,8 @@ impl NodeRuntime {
     }
 
     async fn build_status_snapshot(&mut self) -> Result<NodeStatusSnapshot> {
-        let local_file_count = self.store.list_local().await?.len();
-        let providing_count = self.store.list_providing().await?.len();
+        let local_file_count = self.store.count_local().await?;
+        let providing_count = self.store.count_providing().await?;
 
         Ok(NodeStatusSnapshot {
             peer_id: self.local_peer_id,
@@ -923,25 +599,41 @@ impl NodeRuntime {
         })
     }
 
-    fn begin_provide(
+    async fn begin_provide(
         &mut self,
         cid: String,
         sender: Option<oneshot::Sender<Result<()>>>,
     ) -> Result<()> {
-        validate_cid_hex(&cid)?;
-        let key = NodeBehaviour::local_record_key(&cid);
+        let start_result: Result<QueryId> = async {
+            validate_cid_hex(&cid)?;
+            if self.store.get_manifest(&cid).await?.is_none() {
+                return Err(anyhow!("local manifest not found for cid {cid}"));
+            }
 
-        let query_id = self
-            .swarm
-            .behaviour_mut()
-            .kademlia
-            .start_providing(key)
-            .map_err(|error| anyhow!("failed to start_providing: {error}"))?;
+            let key = NodeBehaviour::local_record_key(&cid);
+            self.swarm
+                .behaviour_mut()
+                .kademlia
+                .start_providing(key)
+                .map_err(|error| anyhow!("failed to start_providing: {error}"))
+        }
+        .await;
 
-        self.pending_provide
-            .insert(query_id, PendingProvide { cid, sender });
+        match start_result {
+            Ok(query_id) => {
+                self.pending_provide
+                    .insert(query_id, PendingProvide { cid, sender });
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(sender) = sender {
+                    let _ = sender.send(Err(error));
+                    return Ok(());
+                }
 
-        Ok(())
+                Err(error)
+            }
+        }
     }
 
     async fn start_download(&mut self, cid: String, output_path: PathBuf) -> Result<()> {
@@ -961,6 +653,7 @@ impl NodeRuntime {
             global_concurrency: self.args.global_download_concurrency.max(1),
             per_peer_concurrency: self.args.per_peer_concurrency.max(1),
             max_retries: 4,
+            provider_discovery_retries: 8,
         };
         let cid_for_task = cid.clone();
 
@@ -1014,7 +707,16 @@ impl NodeRuntime {
         let entries = self.store.list_providing().await?;
 
         for entry in entries {
-            if let Err(error) = self.begin_provide(entry.cid.clone(), None) {
+            if self.store.get_manifest(&entry.cid).await?.is_none() {
+                warn!(
+                    "dropping stale provide state for missing local cid {}",
+                    entry.cid
+                );
+                self.store.remove_provide_state(&entry.cid).await?;
+                continue;
+            }
+
+            if let Err(error) = self.begin_provide(entry.cid.clone(), None).await {
                 warn!("reprovide skipped for {}: {error:#}", entry.cid);
             }
         }
@@ -1061,131 +763,6 @@ impl NodeRuntime {
     }
 }
 
-#[derive(Default)]
-struct PeerState {
-    connected: HashMap<PeerId, HashSet<Multiaddr>>,
-    discovered: HashMap<PeerId, HashSet<Multiaddr>>,
-    dialing: HashSet<PeerId>,
-    last_dial_attempt: HashMap<PeerId, Instant>,
-    listen_addrs: HashSet<Multiaddr>,
-    local_peer_id: Option<PeerId>,
-    dial_cooldown: Option<Duration>,
-}
-
-impl PeerState {
-    fn new(local_peer_id: PeerId, dial_cooldown: Duration) -> Self {
-        Self {
-            local_peer_id: Some(local_peer_id),
-            dial_cooldown: Some(dial_cooldown),
-            ..Self::default()
-        }
-    }
-
-    fn add_discovered(&mut self, peer_id: PeerId, address: Multiaddr) {
-        if self.connected.contains_key(&peer_id) {
-            self.connected.entry(peer_id).or_default().insert(address);
-            return;
-        }
-        self.discovered.entry(peer_id).or_default().insert(address);
-    }
-
-    fn remove_discovered_address(&mut self, peer_id: &PeerId, address: &Multiaddr) {
-        if let Some(addresses) = self.discovered.get_mut(peer_id) {
-            addresses.remove(address);
-            if addresses.is_empty() {
-                self.discovered.remove(peer_id);
-            }
-        }
-    }
-
-    fn on_connected(&mut self, peer_id: PeerId, address: Multiaddr) {
-        self.connected.entry(peer_id).or_default().insert(address);
-        self.dialing.remove(&peer_id);
-        self.discovered.remove(&peer_id);
-    }
-
-    fn on_disconnected(&mut self, peer_id: &PeerId) {
-        self.connected.remove(peer_id);
-        self.dialing.remove(peer_id);
-    }
-
-    fn can_dial(&self, peer_id: &PeerId) -> bool {
-        if Some(*peer_id) == self.local_peer_id {
-            return false;
-        }
-
-        if self.connected.contains_key(peer_id) || self.dialing.contains(peer_id) {
-            return false;
-        }
-
-        if let Some(last_attempt) = self.last_dial_attempt.get(peer_id) {
-            if let Some(cooldown) = self.dial_cooldown {
-                if last_attempt.elapsed() < cooldown {
-                    return false;
-                }
-            }
-        }
-
-        true
-    }
-
-    fn on_dial_started(&mut self, peer_id: PeerId) {
-        self.dialing.insert(peer_id);
-        self.last_dial_attempt.insert(peer_id, Instant::now());
-    }
-
-    fn on_dial_finished(&mut self, peer_id: &PeerId) {
-        self.dialing.remove(peer_id);
-    }
-
-    fn connected_peer_count(&self) -> usize {
-        self.connected.len()
-    }
-
-    fn known_peer_count(&self) -> usize {
-        let mut peers = HashSet::new();
-        peers.extend(self.connected.keys().copied());
-        peers.extend(self.discovered.keys().copied());
-        peers.extend(self.dialing.iter().copied());
-        peers.len()
-    }
-
-    fn snapshots(&self) -> Vec<PeerSnapshot> {
-        let mut peer_ids = HashSet::new();
-        peer_ids.extend(self.connected.keys().copied());
-        peer_ids.extend(self.discovered.keys().copied());
-        peer_ids.extend(self.dialing.iter().copied());
-
-        let mut snapshots = Vec::with_capacity(peer_ids.len());
-        for peer_id in peer_ids {
-            let mut addresses = HashSet::new();
-            if let Some(known) = self.connected.get(&peer_id) {
-                addresses.extend(known.iter().cloned());
-            }
-            if let Some(known) = self.discovered.get(&peer_id) {
-                addresses.extend(known.iter().cloned());
-            }
-
-            snapshots.push(PeerSnapshot {
-                peer_id,
-                addresses: addresses.into_iter().collect(),
-                connected: self.connected.contains_key(&peer_id),
-                dialing: self.dialing.contains(&peer_id),
-            });
-        }
-
-        snapshots.sort_by_key(|snapshot| snapshot.peer_id.to_string());
-        snapshots
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PublicAnnouncement {
-    cid: String,
-    file_len: u64,
-    chunk_size: u32,
-}
-
 impl PublicAnnouncement {
     fn validate(&self) -> Result<()> {
         validate_cid_hex(&self.cid)?;
@@ -1194,11 +771,4 @@ impl PublicAnnouncement {
         }
         Ok(())
     }
-}
-
-fn peer_id_from_multiaddr(address: &Multiaddr) -> Option<PeerId> {
-    address.iter().find_map(|protocol| match protocol {
-        Protocol::P2p(peer_id) => Some(peer_id),
-        _ => None,
-    })
 }

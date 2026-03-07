@@ -74,6 +74,20 @@ p2p-dfs-node cancel-download <cid>
 
 One important note: `add --public` only publishes a gossipsub announcement. If you want other nodes to find the file through the DHT, you still need to run `provide`.
 
+## Local demo
+
+There is a small two-node demo script under `scripts/demo-two-node.sh`. It builds the debug binary if needed, starts two local daemons, adds a file on node A, provides it, downloads it on node B, and verifies that the bytes match.
+
+```bash
+./scripts/demo-two-node.sh
+```
+
+If you want to inspect logs and temporary data after the run, keep the working directory:
+
+```bash
+KEEP_WORKDIR=1 ./scripts/demo-two-node.sh
+```
+
 ## How the daemon is structured
 
 The runtime keeps strict ownership boundaries on purpose. `Swarm<NodeBehaviour>` lives in one task and is never shared across async workers. Anything that needs to talk to the network goes through a command channel.

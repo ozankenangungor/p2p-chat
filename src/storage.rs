@@ -189,15 +189,6 @@ impl RocksStore {
         .await
     }
 
-    pub async fn has_chunk(&self, chunk_hash: &str) -> Result<bool> {
-        let key = chunk_hash.as_bytes().to_vec();
-        self.run_db(move |db| {
-            let cf = cf_handle(&db, CF_CHUNK)?;
-            Ok(db.get_pinned_cf(&cf, key)?.is_some())
-        })
-        .await
-    }
-
     pub async fn get_chunk(&self, chunk_hash: &str) -> Result<Option<Bytes>> {
         let key = chunk_hash.as_bytes().to_vec();
         self.run_db(move |db| {
@@ -220,6 +211,10 @@ impl RocksStore {
             Ok(cids)
         })
         .await
+    }
+
+    pub async fn count_local(&self) -> Result<usize> {
+        self.count_entries(CF_META).await
     }
 
     pub async fn put_provide_state(&self, state: &ProvideState) -> Result<()> {
@@ -249,20 +244,6 @@ impl RocksStore {
         .await
     }
 
-    pub async fn get_provide_state(&self, cid: &str) -> Result<Option<ProvideState>> {
-        let key = cid.as_bytes().to_vec();
-        self.run_db(move |db| {
-            let cf = cf_handle(&db, CF_PROVIDE)?;
-            let value = db.get_cf(&cf, key)?;
-            value
-                .as_deref()
-                .map(serde_json::from_slice::<ProvideState>)
-                .transpose()
-                .map_err(Into::into)
-        })
-        .await
-    }
-
     pub async fn list_providing(&self) -> Result<Vec<ProvideState>> {
         self.run_db(move |db| {
             let cf = cf_handle(&db, CF_PROVIDE)?;
@@ -276,6 +257,10 @@ impl RocksStore {
             Ok(items)
         })
         .await
+    }
+
+    pub async fn count_providing(&self) -> Result<usize> {
+        self.count_entries(CF_PROVIDE).await
     }
 
     pub async fn put_download_progress(&self, progress: &DownloadProgress) -> Result<()> {
@@ -306,50 +291,6 @@ impl RocksStore {
         .await
     }
 
-    pub async fn list_downloads(&self) -> Result<Vec<DownloadProgress>> {
-        self.run_db(move |db| {
-            let cf = cf_handle(&db, CF_DOWNLOAD)?;
-            let iter = db.iterator_cf(&cf, IteratorMode::Start);
-            let mut items = Vec::new();
-            for entry in iter {
-                let (_, value) = entry?;
-                let item: DownloadProgress = serde_json::from_slice(&value)?;
-                items.push(item);
-            }
-            Ok(items)
-        })
-        .await
-    }
-
-    pub async fn remove_download_progress(&self, cid: &str) -> Result<()> {
-        let key = cid.as_bytes().to_vec();
-        let wal_fsync = self.wal_fsync;
-        self.run_db(move |db| {
-            let cf = cf_handle(&db, CF_DOWNLOAD)?;
-            let mut write_options = WriteOptions::default();
-            write_options.set_sync(wal_fsync);
-            db.delete_cf_opt(&cf, key, &write_options)?;
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn compact_all(&self) -> Result<()> {
-        self.run_db(move |db| {
-            let meta_cf = cf_handle(&db, CF_META)?;
-            let chunk_cf = cf_handle(&db, CF_CHUNK)?;
-            let provide_cf = cf_handle(&db, CF_PROVIDE)?;
-            let download_cf = cf_handle(&db, CF_DOWNLOAD)?;
-
-            db.compact_range_cf(&meta_cf, None::<&[u8]>, None::<&[u8]>);
-            db.compact_range_cf(&chunk_cf, None::<&[u8]>, None::<&[u8]>);
-            db.compact_range_cf(&provide_cf, None::<&[u8]>, None::<&[u8]>);
-            db.compact_range_cf(&download_cf, None::<&[u8]>, None::<&[u8]>);
-            Ok(())
-        })
-        .await
-    }
-
     async fn run_db<F, T>(&self, work: F) -> Result<T>
     where
         F: FnOnce(Arc<DB>) -> Result<T> + Send + 'static,
@@ -359,6 +300,20 @@ impl RocksStore {
         tokio::task::spawn_blocking(move || work(db))
             .await
             .map_err(|e| anyhow!("failed to join RocksDB task: {e}"))?
+    }
+
+    async fn count_entries(&self, cf_name: &'static str) -> Result<usize> {
+        self.run_db(move |db| {
+            let cf = cf_handle(&db, cf_name)?;
+            let iter = db.iterator_cf(&cf, IteratorMode::Start);
+            let mut count = 0_usize;
+            for entry in iter {
+                entry?;
+                count = count.saturating_add(1);
+            }
+            Ok(count)
+        })
+        .await
     }
 }
 

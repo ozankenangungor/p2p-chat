@@ -6,6 +6,7 @@ use crate::grpc_api::dfs::control::v1::{
     ProvideResponse, StatusResponse,
 };
 use crate::node::{NodeClient, PeerSnapshot};
+use crate::validation::validate_cid_hex;
 use anyhow::Result;
 use std::path::PathBuf;
 use tonic::{Request, Response, Status};
@@ -28,7 +29,7 @@ impl DfsControl for DfsControlService {
         request: Request<AddFileRequest>,
     ) -> Result<Response<AddFileResponse>, Status> {
         let request = request.into_inner();
-        let path = PathBuf::from(request.path);
+        let path = parse_path(&request.path, "path")?;
 
         let cid = self
             .client
@@ -44,7 +45,8 @@ impl DfsControl for DfsControlService {
         request: Request<ProvideRequest>,
     ) -> Result<Response<ProvideResponse>, Status> {
         let request = request.into_inner();
-        self.client.provide(request.cid).await.map_err(to_status)?;
+        let cid = validate_cid(request.cid)?;
+        self.client.provide(cid).await.map_err(to_status)?;
 
         Ok(Response::new(ProvideResponse { accepted: true }))
     }
@@ -54,10 +56,11 @@ impl DfsControl for DfsControlService {
         request: Request<GetFileRequest>,
     ) -> Result<Response<GetFileResponse>, Status> {
         let request = request.into_inner();
-        let output_path = PathBuf::from(request.output_path);
+        let cid = validate_cid(request.cid)?;
+        let output_path = parse_path(&request.output_path, "output_path")?;
 
         self.client
-            .start_download(request.cid, output_path)
+            .start_download(cid, output_path)
             .await
             .map_err(to_status)?;
 
@@ -85,11 +88,8 @@ impl DfsControl for DfsControlService {
         request: Request<DownloadStatusRequest>,
     ) -> Result<Response<DownloadStatusResponse>, Status> {
         let request = request.into_inner();
-        let progress = self
-            .client
-            .download_status(request.cid.clone())
-            .await
-            .map_err(to_status)?;
+        let cid = validate_cid(request.cid)?;
+        let progress = self.client.download_status(cid).await.map_err(to_status)?;
 
         let progress = progress.ok_or_else(|| Status::not_found("download not found"))?;
         let completed_chunks = u32::try_from(
@@ -116,11 +116,8 @@ impl DfsControl for DfsControlService {
         request: Request<CancelDownloadRequest>,
     ) -> Result<Response<CancelDownloadResponse>, Status> {
         let request = request.into_inner();
-        let cancelled = self
-            .client
-            .cancel_download(request.cid)
-            .await
-            .map_err(to_status)?;
+        let cid = validate_cid(request.cid)?;
+        let cancelled = self.client.cancel_download(cid).await.map_err(to_status)?;
 
         Ok(Response::new(CancelDownloadResponse { cancelled }))
     }
@@ -168,11 +165,37 @@ fn peer_entry(snapshot: PeerSnapshot) -> PeerEntry {
 }
 
 fn to_status(error: anyhow::Error) -> Status {
-    let message = error.to_string();
+    Status::internal(error.to_string())
+}
 
-    if message.contains("invalid") {
-        return Status::invalid_argument(message);
+#[allow(clippy::result_large_err)]
+fn validate_cid(cid: String) -> Result<String, Status> {
+    validate_cid_hex(&cid).map_err(|error| Status::invalid_argument(error.to_string()))?;
+    Ok(cid)
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_path(path: &str, field: &str) -> Result<PathBuf, Status> {
+    if path.trim().is_empty() {
+        return Err(Status::invalid_argument(format!("{field} cannot be empty")));
     }
 
-    Status::internal(message)
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_path, validate_cid};
+
+    #[test]
+    fn reject_empty_path_arguments() {
+        let result = parse_path("   ", "output_path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_invalid_cid_arguments() {
+        let result = validate_cid("abc".to_string());
+        assert!(result.is_err());
+    }
 }

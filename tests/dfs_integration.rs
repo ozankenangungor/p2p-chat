@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
-use p2p_chat::config::DaemonArgs;
-use p2p_chat::node::start_node;
-use p2p_chat::storage::DownloadPhase;
+use p2p_dfs_node::config::DaemonArgs;
+use p2p_dfs_node::node::start_node;
+use p2p_dfs_node::storage::DownloadPhase;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -53,8 +53,6 @@ async fn two_nodes_exchange_metadata_and_chunks() -> Result<()> {
         .await?;
     node_a_handle.client().provide(cid.clone()).await?;
 
-    wait_for_providers(&node_b_handle, &cid).await?;
-
     let output_path = node_b_dir.path().join("download.bin");
     node_b_handle
         .client()
@@ -82,6 +80,36 @@ async fn two_nodes_exchange_metadata_and_chunks() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn providing_unknown_cid_is_rejected() -> Result<()> {
+    let node_dir = TempDir::new()?;
+    let p2p_port = free_local_port()?;
+    let grpc_port = free_local_port()?;
+
+    let args = daemon_args(
+        p2p_port,
+        grpc_port,
+        node_dir.path().to_path_buf(),
+        Vec::new(),
+    )?;
+    let (handle, task) = start_node(args).await?;
+
+    let provide_result = handle.client().provide("0".repeat(64)).await;
+    assert!(provide_result.is_err());
+
+    let error = match provide_result {
+        Ok(()) => String::new(),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("local manifest not found"));
+
+    handle.shutdown()?;
+    task.await
+        .map_err(|error| anyhow!("node join error: {error}"))??;
+
+    Ok(())
+}
+
 fn daemon_args(
     p2p_port: u16,
     grpc_port: u16,
@@ -91,6 +119,7 @@ fn daemon_args(
     Ok(DaemonArgs {
         listen_p2p: format!("/ip4/127.0.0.1/tcp/{p2p_port}").parse()?,
         grpc_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, grpc_port)),
+        allow_remote_control: false,
         peers,
         mdns: false,
         key_file: data_dir.join("node_key.ed25519"),
@@ -109,8 +138,8 @@ fn daemon_args(
 }
 
 async fn wait_for_status(
-    handle: &p2p_chat::node::NodeHandle,
-) -> Result<p2p_chat::node::NodeStatusSnapshot> {
+    handle: &p2p_dfs_node::node::NodeHandle,
+) -> Result<p2p_dfs_node::node::NodeStatusSnapshot> {
     let mut attempts = 0_u32;
     loop {
         let status = handle.client().status().await?;
@@ -128,7 +157,7 @@ async fn wait_for_status(
 }
 
 async fn wait_for_connected_peers(
-    handle: &p2p_chat::node::NodeHandle,
+    handle: &p2p_dfs_node::node::NodeHandle,
     expected: usize,
 ) -> Result<()> {
     for _ in 0..40 {
@@ -142,21 +171,8 @@ async fn wait_for_connected_peers(
     Err(anyhow!("timed out waiting for connected peers"))
 }
 
-async fn wait_for_providers(handle: &p2p_chat::node::NodeHandle, cid: &str) -> Result<()> {
-    for _ in 0..150 {
-        let providers = handle.client().find_providers(cid.to_string()).await?;
-        if !providers.is_empty() {
-            return Ok(());
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    Err(anyhow!("timed out waiting for providers"))
-}
-
 async fn wait_for_download_completion(
-    handle: &p2p_chat::node::NodeHandle,
+    handle: &p2p_dfs_node::node::NodeHandle,
     cid: &str,
 ) -> Result<()> {
     for _ in 0..80 {
